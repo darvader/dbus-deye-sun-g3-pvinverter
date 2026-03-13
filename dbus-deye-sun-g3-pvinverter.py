@@ -5,14 +5,13 @@ import platform
 import logging
 import sys
 import os
-import sys
 if sys.version_info.major == 2:
     import gobject
 else:
     from gi.repository import GLib as gobject
-import sys
 import time
 import configparser  # for config/ini file
+import threading
 from functools import reduce
 
 from pysolarmanv5 import PySolarmanV5
@@ -118,19 +117,22 @@ class DbusDeyeSunG3Service:
         port = int(config['DEFAULT']['Port'])
 
         modbus = PySolarmanV5(
-            address=address, serial=serial, port=port, mb_slave_id=1, verbose=False, auto_reconnect=True
+            address=address, serial=serial, port=port, mb_slave_id=1,
+            verbose=False, auto_reconnect=True, socket_timeout=10
         )
-        
+
         try:
             self._checkResetDailyProduction(modbus)
-            
+
             acEnergyForward = self._getDailyProduction(modbus)
             acPower = self._getTotalACOutputPower(modbus)
             acCurrent = self._getGridCurrent(modbus)
             acVoltage = self._getAcVoltage(modbus)
             firmwareVersion = self._getFirmwareVersion(modbus)
         except Exception as e:
-            logging.critical('Error at %s', '_update', exc_info=e)
+            logging.critical('Error at %s', '_getDeyeData', exc_info=e)
+            modbus.disconnect()
+            return None
 
         modbus.disconnect()
 
@@ -143,30 +145,32 @@ class DbusDeyeSunG3Service:
         }
     
     def _checkResetDailyProduction(self, modbus):
-        oldValues = modbus.read_holding_registers(register_addr=0x0016, quantity=3)
-        newValues = self._calcSystemTime()
+        try:
+            oldValues = modbus.read_holding_registers(register_addr=0x0016, quantity=3)
+            newValues = self._calcSystemTime()
 
-        logging.debug('inverters system time: %s' %oldValues)
-        logging.debug('new system time: %s' %newValues)
+            logging.debug('inverters system time: %s' % oldValues)
+            logging.debug('new system time: %s' % newValues)
 
-        if oldValues[0] != newValues[0] or oldValues[1]/256 != newValues[1]/256:
-            logging.info('updating inverters system time')
-            modbus.write_multiple_holding_registers(register_addr=0x0016, values=newValues)
+            if oldValues[0] != newValues[0] or oldValues[1] / 256 != newValues[1] / 256:
+                logging.info('updating inverters system time')
+                modbus.write_multiple_holding_registers(register_addr=0x0016, values=newValues)
 
-            until = time.time() + 5 * 60
-            while time.time() <= until:
-                try:
-                    dailyProduction = self._getDailyProduction(modbus)
+                # Wait up to 30s (not 5min!) for daily production reset
+                until = time.time() + 30
+                while time.time() <= until:
+                    try:
+                        dailyProduction = self._getDailyProduction(modbus)
+                        if dailyProduction <= 0:
+                            logging.info("successful reset of daily production")
+                            return
+                    except Exception as e:
+                        logging.warning('Error checking daily production reset: %s', e)
+                    time.sleep(5)
 
-                    if dailyProduction <= 0:
-                        logging.info("successful reset of daily production")
-                        return
-                except Exception as e:
-                    logging.critical('Error at %s', '_update', exc_info=e)
-
-                time.sleep(5)
-
-            logging.info("timeout on reset of daily production")
+                logging.warning("timeout on reset of daily production (30s)")
+        except Exception as e:
+            logging.warning('Error in _checkResetDailyProduction: %s', e)
 
     def _calcSystemTime(self):
         now = datetime.now()
@@ -242,13 +246,16 @@ class DbusDeyeSunG3Service:
 
     def _update(self):
         try:
-            # get data from deye
+            # get data from deye (returns None on error)
             deye_data = self._getDeyeData()
 
-            config = self._getConfig()
-            str(config['DEFAULT']['Phase'])
+            if deye_data is None:
+                logging.warning('No data from Deye, skipping update')
+                if self._lastUpdate < (time.time() - 5 * 60):
+                    self._dbusservice['/Connected'] = 0
+                return True
 
-            pvinverter_phase = str(config['DEFAULT']['Phase'])
+            pvinverter_phase = str(self._getConfig()['DEFAULT']['Phase'])
 
             # send data to DBus
             for phase in ['L1', 'L2', 'L3']:
@@ -259,7 +266,6 @@ class DbusDeyeSunG3Service:
                     self._dbusservice[pre + '/Current'] = deye_data['acCurrent']
                     self._dbusservice[pre + '/Power'] = deye_data['acPower']
                     self._dbusservice[pre + '/Energy/Forward'] = deye_data['acEnergyForward']
-
                 else:
                     self._dbusservice[pre + '/Voltage'] = 0
                     self._dbusservice[pre + '/Current'] = 0
@@ -271,33 +277,27 @@ class DbusDeyeSunG3Service:
             self._dbusservice['/Ac/Power'] = self._dbusservice['/Ac/' + pvinverter_phase + '/Power']
             self._dbusservice['/Ac/Energy/Forward'] = self._dbusservice['/Ac/' + pvinverter_phase + '/Energy/Forward']
             self._dbusservice['/Connected'] = 1
-            
+
             # logging
-            logging.debug("House Consumption (/Ac/Power): %s" %(self._dbusservice['/Ac/Power']))
-            logging.debug("House Forward (/Ac/Energy/Forward): %s" %(self._dbusservice['/Ac/Energy/Forward']))
-            logging.debug("---")
+            logging.debug("PV Power (/Ac/Power): %s" % (self._dbusservice['/Ac/Power']))
+            logging.debug("PV Forward (/Ac/Energy/Forward): %s" % (self._dbusservice['/Ac/Energy/Forward']))
 
             # update lastupdate vars
             self._lastUpdate = time.time()
         except Exception as e:
             logging.critical('Error at %s', '_update', exc_info=e)
+            if self._lastUpdate < (time.time() - 5 * 60):
+                self._dbusservice['/Connected'] = 0
 
-            try:
-                if self._lastUpdate < (time.time() - 5 * 60):
-                    self._dbusservice['/Connected'] = 0
-            except Exception as e:
-                logging.critical('Error at %s', '_update', exc_info=e)
- 
         try:
             # increment UpdateIndex - to show that new data is available
-            index = self._dbusservice['/UpdateIndex'] + 1  # increment index
-            if index > 255:   # maximum value of the index
-                index = 0       # overflow from 255 to 0
+            index = self._dbusservice['/UpdateIndex'] + 1
+            if index > 255:
+                index = 0
             self._dbusservice['/UpdateIndex'] = index
         except Exception as e:
-            logging.critical('Error at %s', '_update', exc_info=e)
+            logging.critical('Error at %s', '_update index', exc_info=e)
 
-        # return true, otherwise add_timeout will be removed from GObject - see docs http://library.isr.ist.utl.pt/docs/pygtk2reference/gobject-functions.html#function-gobject--timeout-add
         return True
 
     def _handlechangedvalue(self, path, value):
